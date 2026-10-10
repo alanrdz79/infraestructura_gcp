@@ -21,4 +21,3 @@ google-cloud-secret-manager>=2.18.0
 
 # CloudEvent parsing and serialization specification for EventArc v2
 cloudevents>=1.10.0
-web3==6.11.1

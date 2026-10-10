@@ -70,14 +70,6 @@ try:
 except ImportError:
     requests = None
 
-# web3 (BNB Smart Chain for Binance Predictions)
-try:
-    from web3 import Web3
-    from eth_account import Account
-except ImportError:
-    Web3 = None
-    Account = None
-
 # google-cloud-pubsub
 try:
     from google.cloud import pubsub_v1
@@ -157,9 +149,8 @@ def get_secret_or_env(key: str, default: str = "") -> str:
     # Optional fallback to Secret Manager client if credentials and project are available
     project_id = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT") or DEFAULT_PROJECT_ID
     secret_name_map = {
-        "WEB3_PRIVATE_KEY": "web3-private-key",
-        "BSC_RPC_URL": "bsc-rpc-url",
-        "PREDICTION_CONTRACT_ADDRESS": "prediction-contract-address",
+        "BINANCE_API_KEY": "binance-api-key",
+        "BINANCE_API_SECRET": "binance-api-secret",
         "TELEGRAM_BOT_TOKEN": "telegram-bot-token",
         "TELEGRAM_CHAT_ID": "telegram-chat-id",
         "REDIS_AUTH_TOKEN": "redis-auth-token",
@@ -256,20 +247,32 @@ def stage_1_redis_kill_switch(mock: bool = False) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------
-# STAGE 2: Binance Predictions Web3 Smart Contract Purge
+# STAGE 2: Binance Predictions API Order Purge
 # ------------------------------------------------------------------------------
-def generate_web3_cancel_all_payload(
-    symbol: str, wallet_address: str, contract_address: str
+def generate_binance_cancel_all_payload(
+    symbol: str, api_key: str, secret_key: str, recv_window: int = DEFAULT_RECV_WINDOW
 ) -> Dict[str, Any]:
     """
-    Constructs the payload dictionary representing the EVM emergencyWithdraw transaction.
+    Constructs and HMAC-SHA256 signs a Binance Prediction DELETE payload for emergency order purge.
+    Uses the new /sapi/v1/w3w/wallet/prediction/ endpoints.
     """
+    timestamp = int(time.time() * 1000)
+    query_string = f"symbol={symbol}&timestamp={timestamp}&recvWindow={recv_window}"
+    signature = hmac.new(
+        secret_key.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
     return {
-        "method": "emergencyWithdraw",
-        "contract": contract_address,
-        "wallet": wallet_address,
+        "method": "DELETE",
+        "endpoint": f"{DEFAULT_BINANCE_URL}/sapi/v1/w3w/wallet/prediction/order",
+        "headers": {
+            "X-MBX-APIKEY": api_key,
+        },
         "params": {
-            "market_symbol": symbol,
+            "symbol": symbol,
+            "timestamp": timestamp,
+            "recvWindow": recv_window,
+            "signature": signature,
         },
     }
 
@@ -280,82 +283,65 @@ def stage_2_binance_order_purge(
     mock: bool = False,
 ) -> Dict[str, Any]:
     """
-    Stage 2: Binance Predictions Web3 Order Purge.
-    Retrieves EVM Private Key and BSC RPC URL from Secret Manager, constructs an emergencyWithdraw
-    transaction for the prediction market smart contract, signs it, and broadcasts it to the BNB Smart Chain.
+    Stage 2: Binance Predictions Order Purge (USDT).
+    Retrieves Binance API credentials from Secret Manager/environment, generates HMAC-SHA256
+    signed query string and executes HTTP DELETE on the Binance Prediction API.
     """
     t0 = time.perf_counter()
     target_symbols = symbols if symbols else [symbol]
-    
-    private_key = get_secret_or_env("WEB3_PRIVATE_KEY", "mock_private_key")
-    rpc_url = get_secret_or_env("BSC_RPC_URL", "https://bsc-dataseed.binance.org/")
-    contract_address = get_secret_or_env("PREDICTION_CONTRACT_ADDRESS", "0x0000000000000000000000000000000000000000")
+    api_key = get_secret_or_env("BINANCE_API_KEY", "TEST_API_KEY_MASKED")
+    secret_key = get_secret_or_env("BINANCE_API_SECRET", "TEST_SECRET_KEY_MASKED")
+    base_url = os.environ.get("BINANCE_BASE_URL", DEFAULT_BINANCE_URL).rstrip("/")
+    recv_window = int(os.environ.get("BINANCE_RECV_WINDOW", str(DEFAULT_RECV_WINDOW)))
 
-    logger.info(f"[STAGE 2] Purging Web3 Prediction markets on BSC for symbols: {target_symbols}")
+    logger.info(f"[STAGE 2] Purging USDT open orders on Binance Predictions API for symbols: {target_symbols}")
 
     executed_requests = []
-    
-    # Deriving wallet address from private key if valid
-    wallet_address = "0xMockWalletAddress"
-    if private_key != "mock_private_key" and Account is not None:
-        try:
-            account = Account.from_key(private_key)
-            wallet_address = account.address
-        except Exception:
-            pass
-
-    primary_payload = generate_web3_cancel_all_payload(
-        symbol=target_symbols[0], wallet_address=wallet_address, contract_address=contract_address
+    primary_payload = generate_binance_cancel_all_payload(
+        symbol=target_symbols[0], api_key=api_key, secret_key=secret_key, recv_window=recv_window
     )
 
-    is_dummy_key = private_key in ("mock_private_key", "MOCK", "") or Web3 is None
-
-    # Connect to BSC
-    w3 = Web3(Web3.HTTPProvider(rpc_url)) if Web3 is not None and not is_dummy_key else None
-
-    # Minimal ERC20 ABI for the emergency function
-    abi = '[{"inputs":[{"internalType":"string","name":"market_symbol","type":"string"}],"name":"emergencyWithdraw","outputs":[],"stateMutability":"nonpayable","type":"function"}]'
+    is_dummy_key = api_key in ("TEST_API_KEY_MASKED", "mock", "MOCK", "") or secret_key in ("TEST_SECRET_KEY_MASKED", "mock", "MOCK", "")
 
     for sym in target_symbols:
-        if mock or is_dummy_key or w3 is None or not w3.is_connected():
+        payload = generate_binance_cancel_all_payload(
+            symbol=sym, api_key=api_key, secret_key=secret_key, recv_window=recv_window
+        )
+        if mock or is_dummy_key or requests is None:
             executed_requests.append({
                 "symbol": sym,
                 "status": "MOCKED",
-                "tx_hash": f"0xmocktxhash_{sym}",
-                "contract": contract_address,
+                "status_code": 200,
+                "endpoint": f"{base_url}/sapi/v1/w3w/wallet/prediction/order",
+                "recvWindow": recv_window,
+                "signature": payload["params"]["signature"],
             })
         else:
             try:
-                contract = w3.eth.contract(address=w3.to_checksum_address(contract_address), abi=abi)
-                nonce = w3.eth.get_transaction_count(wallet_address)
-                
-                # Build transaction
-                tx = contract.functions.emergencyWithdraw(sym).build_transaction({
-                    'chainId': 56, # BSC Mainnet
-                    'gas': 200000,
-                    'gasPrice': w3.eth.gas_price,
-                    'nonce': nonce,
-                })
-                
-                # Sign transaction
-                signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
-                
-                # Send transaction
-                tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
-                
+                query_str = f"symbol={sym}&timestamp={payload['params']['timestamp']}&recvWindow={recv_window}&signature={payload['params']['signature']}"
+                req_url = f"{base_url}/sapi/v1/w3w/wallet/prediction/order?{query_str}"
+                resp = requests.delete(
+                    req_url,
+                    headers={"X-MBX-APIKEY": api_key},
+                    timeout=3.0,
+                )
                 executed_requests.append({
                     "symbol": sym,
-                    "status": "SUCCESS",
-                    "tx_hash": w3.to_hex(tx_hash),
-                    "contract": contract_address,
+                    "status": "SUCCESS" if resp.status_code in (200, 400) else "ERROR",
+                    "status_code": resp.status_code,
+                    "endpoint": f"{base_url}/sapi/v1/w3w/wallet/prediction/order",
+                    "recvWindow": recv_window,
+                    "signature": payload["params"]["signature"],
+                    "response": resp.text[:200],
                 })
             except Exception as exc:
-                logger.error(f"[STAGE 2] Web3 transaction failed for {sym}: {exc}")
+                logger.error(f"[STAGE 2] Binance Prediction API DELETE failed for {sym}: {exc}")
                 executed_requests.append({
                     "symbol": sym,
                     "status": "FAILED",
+                    "status_code": 500,
+                    "endpoint": f"{base_url}/sapi/v1/w3w/wallet/prediction/order",
                     "error": str(exc),
-                    "contract": contract_address,
                 })
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -363,16 +349,16 @@ def stage_2_binance_order_purge(
     if any(r.get("status") == "MOCKED" for r in executed_requests):
         overall_status = "MOCKED"
 
-    logger.info(f"[STAGE 2] Web3 Prediction purge completed with status {overall_status} in {elapsed_ms:.2f}ms")
+    logger.info(f"[STAGE 2] USDT Prediction purge completed with status {overall_status} in {elapsed_ms:.2f}ms")
     return {
         "stage": 2,
-        "name": "BINANCE_PREDICTIONS_WEB3_PURGE",
+        "name": "BINANCE_PREDICTIONS_API_PURGE",
         "status": overall_status,
         "symbols": target_symbols,
         "primary_payload": primary_payload,
         "executed_requests": executed_requests,
         "elapsed_ms": round(elapsed_ms, 3),
-        "details": f"Purged prediction orders for {len(target_symbols)} symbols on BSC",
+        "details": f"Purged USDT prediction orders for {len(target_symbols)} symbols via API",
     }
 
 
@@ -473,7 +459,7 @@ def stage_4_telegram_alert_broadcast(
         f"🚨 *CONTINUITY HFT EMERGENCY KILL SWITCH ACTIVATED* 🚨\n"
         f"• Motivo: `{reason}`\n"
         f"• Símbolo: `{symbol}`\n"
-        f"• Posiciones Cerradas: `TODAS (emergencyWithdraw en BNB Smart Chain)`\n"
+        f"• Órdenes Canceladas: `TODAS (DELETE /sapi/v1/w3w/wallet/prediction/order)`\n"
         f"• Estado del Motor: `HALTED (Zero New Orders)`\n"
         f"• Timestamp: `{now_iso}`"
     )
@@ -586,7 +572,7 @@ def execute_emergency_shutdown(
         f"🚨 *CONTINUITY HFT EMERGENCY KILL SWITCH ACTIVATED* 🚨\n"
         f"• Motivo: `{reason}`\n"
         f"• Símbolo: `{symbol}`\n"
-        f"• Posiciones Cerradas: `TODAS (emergencyWithdraw en BNB Smart Chain)`\n"
+        f"• Órdenes Canceladas: `TODAS (DELETE /sapi/v1/w3w/wallet/prediction/order)`\n"
         f"• Estado del Motor: `HALTED (Zero New Orders)`\n"
         f"• Timestamp: `{datetime.now(timezone.utc).isoformat()}`"
     )
